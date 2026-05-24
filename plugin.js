@@ -1,7 +1,7 @@
-exports.version = 1.25
+exports.version = 1.30
 exports.apiRequired = 10.3
 exports.repo = "nez3rall/hfs-advanced-core-api"
-exports.description = "Расширенный API: Безопасный просмотр файлов, авторизация и парсинг с учетом VFS прав"
+exports.description = "Расширенный API (Исправлены баги авторизации и доступа к VFS)"
 
 exports.config = {
     apiPrefix: {
@@ -17,25 +17,28 @@ exports.init = async api => {
     // Вспомогательная функция проверки прав
     async function checkAccess(ctx, node, permissionType = 'read') {
         const user = ctx.session?.user || 'guest';
-        if (api.canAccess) {
+        if (typeof api.canAccess === 'function') {
             return await api.canAccess(node, user, permissionType);
         }
         const perms = node.permissions?.[permissionType] || [];
         return perms.length === 0 || perms.includes(user);
     }
 
-    // Вспомогательная функция поиска ноды VFS
+    // Умный поиск папки (учитывает разные структуры VFS)
     async function findVfsNodeByPath(vfs, searchPath) {
-        if (!vfs || !vfs.children) return null;
-        if (searchPath === '/' || searchPath === '') return vfs; // Корень
+        if (!vfs) return null;
+        if (searchPath === '/' || searchPath === '') return vfs;
         
         const parts = searchPath.split('/').filter(Boolean);
         let currentNode = vfs;
         
         for (const part of parts) {
             const decodedPart = decodeURIComponent(part);
-            if (currentNode.children && currentNode.children[decodedPart]) {
-                currentNode = currentNode.children[decodedPart];
+            // В одних версиях HFS вложенные папки лежат в .children, в других - прямо в объекте
+            const children = currentNode.children || currentNode; 
+            
+            if (children && children[decodedPart]) {
+                currentNode = children[decodedPart];
             } else {
                 return null;
             }
@@ -45,38 +48,23 @@ exports.init = async api => {
 
     exports.middleware = async (ctx, next) => {
         const prefix = api.getConfig('apiPrefix') || '/api/v1';
-        
         if (!ctx.path.startsWith(prefix)) return next();
 
         const relativePath = ctx.path.substring(prefix.length);
         const user = ctx.session?.user || 'guest';
 
         try {
-            // 1. КОРЕНЬ API (Исправление ошибки 500)
+            // 1. КОРЕНЬ API
             if (relativePath === '' || relativePath === '/') {
                 ctx.status = 200;
-                ctx.type = 'application/json';
-                ctx.body = {
-                    status: "success",
-                    message: "HFS Advanced Core API работает стабильно",
-                    currentUser: user,
-                    endpoints: {
-                        me: `${prefix}/auth/me`,
-                        login: `${prefix}/auth/login (POST: username, password)`,
-                        logout: `${prefix}/auth/logout`,
-                        browse: `${prefix}/browse?path=/`,
-                        fileInfo: `${prefix}/file-info?path=/file.txt`
-                    }
-                };
+                ctx.body = { status: "success", message: "API работает (v1.30)" };
                 return ctx.stop?.() || true;
             }
 
-            // 2. АВТОРИЗАЦИЯ
+            // 2. ИСПРАВЛЕННАЯ АВТОРИЗАЦИЯ
             if (relativePath === '/auth/login' && ctx.method === 'POST') {
-                // Если используем встроенный парсер body Koa, либо пытаемся достать из сырого запроса
                 let body = {};
                 try {
-                    // Костыль, если koa-body не подключен глобально
                     if (ctx.request.body) body = ctx.request.body;
                     else {
                         const rawBody = await new Promise(resolve => {
@@ -91,8 +79,15 @@ exports.init = async api => {
                 const username = body.username || ctx.query.username;
                 const password = body.password || ctx.query.password;
 
-                const accounts = api.getConfig('accounts') || {};
-                const account = accounts[username];
+                const accounts = api.getConfig('accounts') || [];
+                let account = null;
+                
+                // Исправление: Ищем аккаунт в массиве (HFS 3/4)
+                if (Array.isArray(accounts)) {
+                    account = accounts.find(a => (a.name === username || a.username === username));
+                } else {
+                    account = accounts[username];
+                }
 
                 if (account && account.password === password) {
                     if (!ctx.session) ctx.session = {};
@@ -100,7 +95,7 @@ exports.init = async api => {
                     ctx.body = { status: "success", message: `Добро пожаловать, ${username}!`, user: username };
                 } else {
                     ctx.status = 401;
-                    ctx.body = { status: "error", message: "Неверные данные" };
+                    ctx.body = { status: "error", message: "Неверный логин или пароль" };
                 }
                 return ctx.stop?.() || true;
             }
@@ -112,15 +107,24 @@ exports.init = async api => {
 
             if (relativePath === '/auth/logout') {
                 if (ctx.session) ctx.session.user = 'guest';
-                ctx.body = { status: "success", message: "Вы вышли из аккаунта" };
+                ctx.body = { status: "success", message: "Успешный выход" };
                 return ctx.stop?.() || true;
             }
 
-            // 3. ПОЛУЧЕНИЕ VFS (Для Browse и FileInfo)
-            const vfs = typeof api.getVfs === 'function' ? await api.getVfs() : null;
+            // 3. ИСПРАВЛЕННОЕ ПОЛУЧЕНИЕ VFS
+            // Перебираем все возможные варианты хранения дерева в HFS
+            let vfs = null;
+            if (typeof api.getVfs === 'function') vfs = await api.getVfs();
+            if (!vfs && api.vfs) vfs = api.vfs;
+            if (!vfs) vfs = api.getConfig('vfs');
+
             if (!vfs) {
                 ctx.status = 500;
-                ctx.body = { status: "error", message: "VFS не инициализирована сервером" };
+                ctx.body = { 
+                    status: "error", 
+                    message: "Критическая ошибка: Дерево VFS не найдено",
+                    debug_methods: Object.keys(api) // Отправляем доступные методы для отладки
+                };
                 return ctx.stop?.() || true;
             }
 
@@ -131,11 +135,10 @@ exports.init = async api => {
 
                 if (!targetNode) {
                     ctx.status = 404;
-                    ctx.body = { status: "error", message: "Папка не найдена" };
+                    ctx.body = { status: "error", message: "Папка не найдена в VFS" };
                     return ctx.stop?.() || true;
                 }
 
-                // Корневая папка (/) всегда доступна для чтения структуры
                 if (targetPath !== '/' && !(await checkAccess(ctx, targetNode, 'read'))) {
                     ctx.status = 403;
                     ctx.body = { status: "error", message: "Доступ запрещен" };
@@ -143,16 +146,21 @@ exports.init = async api => {
                 }
 
                 const items = [];
-                if (targetNode.children) {
-                    for (const [name, childNode] of Object.entries(targetNode.children)) {
-                        if (await checkAccess(ctx, childNode, 'read')) {
-                            items.push({
-                                name: name,
-                                type: childNode.type || (childNode.children ? 'folder' : 'file'),
-                                size: childNode.size || 0,
-                                isDisk: name.includes(':')
-                            });
-                        }
+                // Берем дочерние элементы с защитой от разных структур данных
+                const children = targetNode.children || targetNode;
+                
+                for (const [name, childNode] of Object.entries(children)) {
+                    // Защита: пропускаем системные свойства конфигурации
+                    if (['source', 'permissions', 'type', 'name', 'mime', 'size', 'mtime'].includes(name)) continue;
+                    if (typeof childNode !== 'object' || childNode === null) continue;
+
+                    if (await checkAccess(ctx, childNode, 'read')) {
+                        items.push({
+                            name: name,
+                            type: childNode.type || (childNode.children ? 'folder' : 'file'),
+                            size: childNode.size || 0,
+                            isDisk: name.includes(':')
+                        });
                     }
                 }
 
@@ -160,12 +168,12 @@ exports.init = async api => {
                 return ctx.stop?.() || true;
             }
 
-            // 5. ИНФОРМАЦИЯ О ФАЙЛЕ
+            // 5. ИНФОРМАЦИЯ О ФАЙЛЕ (без изменений)
             if (relativePath === '/file-info') {
                 const filePath = ctx.query.path;
                 const fileNode = await findVfsNodeByPath(vfs, filePath);
                 
-                if (!fileNode || fileNode.children) {
+                if (!fileNode || fileNode.children || typeof fileNode !== 'object') {
                     ctx.status = 404;
                     ctx.body = { status: "error", message: "Файл не найден" };
                     return ctx.stop?.() || true;
@@ -181,7 +189,6 @@ exports.init = async api => {
                 const isText = ['txt', 'log', 'json', 'ini', 'md'].includes(ext);
                 let content = null;
 
-                // Если это мелкий текст, пробуем прочесть (защита 1MB)
                 if (isText && fileNode.source && (fileNode.size || 0) < 1024 * 1024) {
                     try {
                         content = await api.require('fs').promises.readFile(fileNode.source, 'utf8');
