@@ -1,7 +1,7 @@
-exports.version = 1.01
+exports.version = 1.25
 exports.apiRequired = 10.3
-exports.repo = "nez3r/hfs-advanced-core-api"
-exports.description = "Расширенный API: Безопасный просмотр файлов, авторизация через формы и парсинг контента с учетом VFS прав"
+exports.repo = "nez3rall/hfs-advanced-core-api"
+exports.description = "Расширенный API: Безопасный просмотр файлов, авторизация и парсинг с учетом VFS прав"
 
 exports.config = {
     apiPrefix: {
@@ -13,7 +13,8 @@ exports.config = {
 }
 
 exports.init = async api => {
-    // Вспомогательная функция для проверки прав на конкретный узел VFS
+    
+    // Вспомогательная функция проверки прав
     async function checkAccess(ctx, node, permissionType = 'read') {
         const user = ctx.session?.user || 'guest';
         if (api.canAccess) {
@@ -23,18 +24,20 @@ exports.init = async api => {
         return perms.length === 0 || perms.includes(user);
     }
 
-    // Вспомогательная функция поиска узла VFS по его URI путю
+    // Вспомогательная функция поиска ноды VFS
     async function findVfsNodeByPath(vfs, searchPath) {
         if (!vfs || !vfs.children) return null;
-        const parts = searchPath.split('/').filter(Boolean);
+        if (searchPath === '/' || searchPath === '') return vfs; // Корень
         
+        const parts = searchPath.split('/').filter(Boolean);
         let currentNode = vfs;
+        
         for (const part of parts) {
             const decodedPart = decodeURIComponent(part);
             if (currentNode.children && currentNode.children[decodedPart]) {
                 currentNode = currentNode.children[decodedPart];
             } else {
-                return null; // Путь не найден в дереве VFS
+                return null;
             }
         }
         return currentNode;
@@ -43,178 +46,164 @@ exports.init = async api => {
     exports.middleware = async (ctx, next) => {
         const prefix = api.getConfig('apiPrefix') || '/api/v1';
         
-        // Проверяем, относится ли запрос к нашему API
-        if (!ctx.path.startsWith(prefix)) {
-            return next();
-        }
+        if (!ctx.path.startsWith(prefix)) return next();
 
         const relativePath = ctx.path.substring(prefix.length);
         const user = ctx.session?.user || 'guest';
 
         try {
-            // ==========================================================
-            // 1. ЭНДПОИНТ: АВТОРИЗАЦИЯ (Вход в аккаунт через HTML)
-            // ==========================================================
-            if (relativePath === '/auth/login' && ctx.method === 'POST') {
-                const { username, password } = ctx.request?.body || ctx.query || {};
-                
-                if (!username || !password) {
-                    ctx.status = 400;
-                    ctx.body = { status: "error", message: "Укажите username и password" };
-                    return ctx.stop?.() || true;
-                }
+            // 1. КОРЕНЬ API (Исправление ошибки 500)
+            if (relativePath === '' || relativePath === '/') {
+                ctx.status = 200;
+                ctx.type = 'application/json';
+                ctx.body = {
+                    status: "success",
+                    message: "HFS Advanced Core API работает стабильно",
+                    currentUser: user,
+                    endpoints: {
+                        me: `${prefix}/auth/me`,
+                        login: `${prefix}/auth/login (POST: username, password)`,
+                        logout: `${prefix}/auth/logout`,
+                        browse: `${prefix}/browse?path=/`,
+                        fileInfo: `${prefix}/file-info?path=/file.txt`
+                    }
+                };
+                return ctx.stop?.() || true;
+            }
 
-                // Используем внутренний метод HFS для проверки учетных данных
-                // Примечание: В зависимости от точной минорной версии HFS v3/v4 метод может называться верификатором аккаунтов.
+            // 2. АВТОРИЗАЦИЯ
+            if (relativePath === '/auth/login' && ctx.method === 'POST') {
+                // Если используем встроенный парсер body Koa, либо пытаемся достать из сырого запроса
+                let body = {};
+                try {
+                    // Костыль, если koa-body не подключен глобально
+                    if (ctx.request.body) body = ctx.request.body;
+                    else {
+                        const rawBody = await new Promise(resolve => {
+                            let data = '';
+                            ctx.req.on('data', chunk => data += chunk);
+                            ctx.req.on('end', () => resolve(data));
+                        });
+                        body = rawBody ? JSON.parse(rawBody) : {};
+                    }
+                } catch(e) {}
+
+                const username = body.username || ctx.query.username;
+                const password = body.password || ctx.query.password;
+
                 const accounts = api.getConfig('accounts') || {};
                 const account = accounts[username];
 
                 if (account && account.password === password) {
-                    // Создаем или обновляем сессию HFS
                     if (!ctx.session) ctx.session = {};
                     ctx.session.user = username;
-                    
-                    ctx.status = 200;
-                    ctx.body = { 
-                        status: "success", 
-                        message: `Успешный вход. Добро пожаловать, ${username}!`,
-                        user: username 
-                    };
+                    ctx.body = { status: "success", message: `Добро пожаловать, ${username}!`, user: username };
                 } else {
                     ctx.status = 401;
-                    ctx.body = { status: "error", message: "Неверное имя пользователя или пароль" };
+                    ctx.body = { status: "error", message: "Неверные данные" };
                 }
                 return ctx.stop?.() || true;
             }
 
-            // Статус текущей сессии (Кто я?)
             if (relativePath === '/auth/me') {
                 ctx.body = { status: "success", user: user, isGuest: user === 'guest' };
                 return ctx.stop?.() || true;
             }
 
-            // Выход из аккаунта
             if (relativePath === '/auth/logout') {
                 if (ctx.session) ctx.session.user = 'guest';
-                ctx.body = { status: "success", message: "Вы успешно вышли" };
+                ctx.body = { status: "success", message: "Вы вышли из аккаунта" };
                 return ctx.stop?.() || true;
             }
 
-            // ==========================================================
-            // ДЛЯ ВСЕХ ОСТАЛЬНЫХ МЕТОДОВ ТРЕБУЕТСЯ ДОСТУП К ДЕРЕВУ VFS
-            // ==========================================================
+            // 3. ПОЛУЧЕНИЕ VFS (Для Browse и FileInfo)
             const vfs = typeof api.getVfs === 'function' ? await api.getVfs() : null;
             if (!vfs) {
                 ctx.status = 500;
-                ctx.body = { status: "error", message: "Ошибка инициализации подсистемы VFS" };
+                ctx.body = { status: "error", message: "VFS не инициализирована сервером" };
                 return ctx.stop?.() || true;
             }
 
-            // ==========================================================
-            // 2. ЭНДПОИНТ: ПРОСМОТР СОДЕРЖИМОГО ДИРЕКТОРИИ
-            // ==========================================================
+            // 4. ПРОСМОТР КАТАЛОГОВ
             if (relativePath === '/browse') {
-                const targetPath = ctx.query.path || '/'; // Передаем ?path=/iso или ?path=/D:/
+                const targetPath = ctx.query.path || '/';
                 const targetNode = await findVfsNodeByPath(vfs, targetPath);
 
                 if (!targetNode) {
                     ctx.status = 404;
-                    ctx.body = { status: "error", message: "Указанный каталог не найден в VFS" };
+                    ctx.body = { status: "error", message: "Папка не найдена" };
                     return ctx.stop?.() || true;
                 }
 
-                // Проверяем права на чтение этой директории
-                const hasAccess = await checkAccess(ctx, targetNode, 'read');
-                if (!hasAccess) {
+                // Корневая папка (/) всегда доступна для чтения структуры
+                if (targetPath !== '/' && !(await checkAccess(ctx, targetNode, 'read'))) {
                     ctx.status = 403;
-                    ctx.body = { status: "error", message: "Доступ к этому каталогу ограничен для вашего аккаунта" };
+                    ctx.body = { status: "error", message: "Доступ запрещен" };
                     return ctx.stop?.() || true;
                 }
 
-                // Собираем содержимое
                 const items = [];
                 if (targetNode.children) {
                     for (const [name, childNode] of Object.entries(targetNode.children)) {
-                        // Фильтруем элементы внутри папки по правам
                         if (await checkAccess(ctx, childNode, 'read')) {
                             items.push({
                                 name: name,
                                 type: childNode.type || (childNode.children ? 'folder' : 'file'),
                                 size: childNode.size || 0,
-                                modified: childNode.mtime || null
+                                isDisk: name.includes(':')
                             });
                         }
                     }
                 }
 
-                ctx.body = {
-                    status: "success",
-                    currentPath: targetPath,
-                    items: items
-                };
+                ctx.body = { status: "success", currentPath: targetPath, items: items };
                 return ctx.stop?.() || true;
             }
 
-            // ==========================================================
-            // 3. ЭНДПОИНТ: ПАРСИНГ ФАЙЛА (Чтение метаданных/контента)
-            // ==========================================================
+            // 5. ИНФОРМАЦИЯ О ФАЙЛЕ
             if (relativePath === '/file-info') {
-                const filePath = ctx.query.path; // ?path=/iso/notes.txt
-                if (!filePath) {
-                    ctx.status = 400;
-                    ctx.body = { status: "error", message: "Параметр path обязателен" };
-                    return ctx.stop?.() || true;
-                }
-
+                const filePath = ctx.query.path;
                 const fileNode = await findVfsNodeByPath(vfs, filePath);
+                
                 if (!fileNode || fileNode.children) {
                     ctx.status = 404;
-                    ctx.body = { status: "error", message: "Файл не найден или является папкой" };
+                    ctx.body = { status: "error", message: "Файл не найден" };
                     return ctx.stop?.() || true;
                 }
 
-                // Проверяем права
-                const hasAccess = await checkAccess(ctx, fileNode, 'read');
-                if (!hasAccess) {
+                if (!(await checkAccess(ctx, fileNode, 'read'))) {
                     ctx.status = 403;
-                    ctx.body = { status: "error", message: "У вас нет прав на просмотр этого файла" };
+                    ctx.body = { status: "error", message: "Доступ к файлу запрещен" };
                     return ctx.stop?.() || true;
                 }
 
-                // Базовая информация о файле
-                const fileInfo = {
-                    name: decodeURIComponent(filePath.split('/').pop()),
-                    size: fileNode.size || 0,
-                    mime: fileNode.mime || 'application/octet-stream',
-                    extension: filePath.split('.').pop().toLowerCase()
-                };
+                const ext = filePath.split('.').pop().toLowerCase();
+                const isText = ['txt', 'log', 'json', 'ini', 'md'].includes(ext);
+                let content = null;
 
-                // Умный парсинг текстовых файлов (например, .txt, .log, .json, .ini)
-                const textExtensions = ['txt', 'log', 'json', 'ini', 'inf', 'bat'];
-                if (textExtensions.includes(fileInfo.extension) && fileInfo.size < 1024 * 1024) { // Ограничение в 1МБ для безопасности
+                // Если это мелкий текст, пробуем прочесть (защита 1MB)
+                if (isText && fileNode.source && (fileNode.size || 0) < 1024 * 1024) {
                     try {
-                        const fs = api.require('fs').promises;
-                        // Если у ноды есть реальный физический путь на диске
-                        if (fileNode.source) {
-                            const content = await fs.readFile(fileNode.source, 'utf8');
-                            fileInfo.isText = true;
-                            fileInfo.content = content;
-                        }
-                    } catch (fsErr) {
-                        fileInfo.contentError = "Не удалось прочесть содержимое с диска";
-                    }
+                        content = await api.require('fs').promises.readFile(fileNode.source, 'utf8');
+                    } catch(e) {}
                 }
 
                 ctx.body = {
                     status: "success",
-                    file: fileInfo
+                    file: {
+                        name: decodeURIComponent(filePath.split('/').pop()),
+                        size: fileNode.size || 0,
+                        type: ext,
+                        isText: !!content,
+                        content: content
+                    }
                 };
                 return ctx.stop?.() || true;
             }
 
-        } catch (globalErr) {
+        } catch (err) {
             ctx.status = 500;
-            ctx.body = { status: "error", message: "Критическая ошибка API", details: globalErr.message };
+            ctx.body = { status: "error", message: "Ошибка API", details: err.message };
             return ctx.stop?.() || true;
         }
 
